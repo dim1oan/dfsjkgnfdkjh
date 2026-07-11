@@ -117,6 +117,7 @@ class HostVDSClient:
         self._auth_url = auth_url
         self._token: str | None = None
         self._compute_url: str | None = None
+        self._network_url: str | None = None
 
     async def _authenticate(self, session: aiohttp.ClientSession) -> None:
         """Keystone: получаем токен и endpoint сервиса compute."""
@@ -182,14 +183,17 @@ class HostVDSClient:
         wanted_interface = (settings.hostvds_interface or "public").lower()
         wanted_region = settings.hostvds_region_name
         for svc in body["token"]["catalog"]:
-            if svc["type"] != "compute":
+            if svc["type"] not in ("compute", "network"):
                 continue
             for ep in svc["endpoints"]:
                 if ep["interface"] != wanted_interface:
                     continue
                 if wanted_region and ep.get("region") != wanted_region:
                     continue
-                self._compute_url = ep["url"]
+                if svc["type"] == "compute":
+                    self._compute_url = ep["url"]
+                else:
+                    self._network_url = ep["url"].rstrip("/")
                 break
         if not self._compute_url:
             raise ProvisioningError(
@@ -204,16 +208,93 @@ class HostVDSClient:
     async def _find_id(
         self, session: aiohttp.ClientSession, path: str, key: str, name: str
     ) -> str:
-        """Ищет ID flavor/image по имени."""
+        """Ищет ID flavor/image по имени.
+
+        Сначала точное совпадение (без учёта регистра), затем «мягкое»:
+        пробелы/дефисы/подчёркивания считаются одинаковыми, суффикс -amd64
+        не обязателен. Например, «Ubuntu 24.04» найдёт «Ubuntu-24.04-amd64».
+        """
         async with session.get(
             f"{self._compute_url}{path}", headers=self._headers()
         ) as resp:
             data = await resp.json()
-        for item in data.get(key, []):
+        items = data.get(key, [])
+
+        # 1. Точное совпадение без учёта регистра
+        for item in items:
             if item["name"].lower() == name.lower():
                 return item["id"]
-        raise ProvisioningError(f"{key}: «{name}» не найден. Доступны: "
-                                + ", ".join(i["name"] for i in data.get(key, [])))
+
+        # 2. Мягкое совпадение: нормализуем разделители и суффикс -amd64.
+        #    Образы с префиксом OLD_ пропускаем — это устаревшие версии.
+        def norm(s: str) -> str:
+            s = s.lower()
+            s = re.sub(r"[-_\s]+", "-", s)
+            s = re.sub(r"-amd64$", "", s)
+            return s
+
+        target = norm(name)
+        for item in items:
+            if item["name"].startswith("OLD_"):
+                continue
+            if norm(item["name"]) == target:
+                logger.info(
+                    "%s: «%s» сопоставлен с «%s»", key, name, item["name"]
+                )
+                return item["id"]
+
+        # Не найден — показываем только актуальные (не OLD_) варианты
+        actual = [i["name"] for i in items if not i["name"].startswith("OLD_")]
+        raise ProvisioningError(
+            f"{key}: «{name}» не найден. Доступны: " + ", ".join(actual)
+        )
+
+    async def _find_network_id(self, session: aiohttp.ClientSession) -> str:
+        """Возвращает UUID сети для подключения сервера.
+
+        Сначала пробуем Nova-прокси /os-networks; если он недоступен —
+        Neutron (сервис network из каталога Keystone). Предпочитаем сеть
+        с именем, содержащим public/ext/internet; иначе берём первую.
+        """
+        def pick(nets: list[dict]) -> str | None:
+            if not nets:
+                return None
+            for net in nets:
+                label = (net.get("label") or net.get("name") or "").lower()
+                if any(w in label for w in ("public", "ext", "internet")):
+                    return net["id"]
+            return nets[0]["id"]
+
+        # 1. Nova: GET /os-networks
+        try:
+            async with session.get(
+                f"{self._compute_url}/os-networks", headers=self._headers()
+            ) as resp:
+                if resp.status == 200:
+                    net_id = pick((await resp.json()).get("networks", []))
+                    if net_id:
+                        return net_id
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            pass
+
+        # 2. Neutron: GET /v2.0/networks
+        if self._network_url:
+            try:
+                async with session.get(
+                    f"{self._network_url}/v2.0/networks",
+                    headers=self._headers(),
+                ) as resp:
+                    if resp.status == 200:
+                        net_id = pick((await resp.json()).get("networks", []))
+                        if net_id:
+                            return net_id
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                pass
+
+        raise ProvisioningError(
+            "Не удалось найти сеть для сервера: провайдер отклонил "
+            "networks='auto', а список сетей получить не получилось."
+        )
 
     async def create_server(
         self, country_code: str, panel_user: str, panel_pass: str
@@ -251,17 +332,44 @@ class HostVDSClient:
                     "networks": "auto",
                 }
             }
+            # networks="auto" требует микроверсию Nova API >= 2.37,
+            # поэтому передаём соответствующий заголовок.
+            create_headers = {
+                **self._headers(),
+                "X-OpenStack-Nova-API-Version": "2.37",
+            }
             async with session.post(
                 f"{self._compute_url}/servers",
                 json=payload,
-                headers=self._headers(),
+                headers=create_headers,
             ) as resp:
-                if resp.status not in (200, 202):
+                if resp.status in (200, 202):
+                    server_id = (await resp.json())["server"]["id"]
+                elif resp.status == 400:
+                    # Микроверсия не поддерживается — выбираем сеть по UUID.
+                    err_text = await resp.text()
+                    logger.warning(
+                        "networks='auto' отклонён (%s), пробую явный UUID сети",
+                        err_text[:200],
+                    )
+                    net_id = await self._find_network_id(session)
+                    payload["server"]["networks"] = [{"uuid": net_id}]
+                    async with session.post(
+                        f"{self._compute_url}/servers",
+                        json=payload,
+                        headers=self._headers(),
+                    ) as resp2:
+                        if resp2.status not in (200, 202):
+                            raise ProvisioningError(
+                                f"Создание сервера отклонено ({resp2.status}): "
+                                f"{await resp2.text()}"
+                            )
+                        server_id = (await resp2.json())["server"]["id"]
+                else:
                     raise ProvisioningError(
                         f"Создание сервера отклонено ({resp.status}): "
                         f"{await resp.text()}"
                     )
-                server_id = (await resp.json())["server"]["id"]
             logger.info("Сервер %s создаётся (id=%s)…", country_code, server_id)
 
             # Ждём ACTIVE (до ~5 минут)
