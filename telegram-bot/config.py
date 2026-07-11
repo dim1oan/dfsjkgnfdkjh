@@ -51,11 +51,26 @@ class Settings(BaseSettings):
 
     # ── HostVDS (OpenStack API) — для автоаренды серверов ────────────────────
     # Данные из панели HostVDS: раздел API / OpenStack credentials.
-    hostvds_auth_url: str = "https://api.hostvds.com:5000/v3"
+    #
+    # ВАЖНО: HOSTVDS_AUTH_URL нужно взять из файла openrc.sh, который
+    # скачивается в панели HostVDS (раздел API → «OpenStack CLI клиент»).
+    # Внутри openrc.sh найдите строку:
+    #     export OS_AUTH_URL=https://<адрес>/v3
+    # и скопируйте её значение в .env:
+    #     HOSTVDS_AUTH_URL=https://<адрес>/v3
+    # Логин (HOSTVDS_USERNAME) — это значение вида hostvds-xxxx из панели,
+    # проект (HOSTVDS_PROJECT_NAME) и домен — тоже из openrc.sh
+    # (OS_PROJECT_NAME / OS_USER_DOMAIN_NAME).
+    hostvds_auth_url: str | None = None
     hostvds_username: str | None = None
     hostvds_password: str | None = None
     hostvds_project_name: str | None = None
     hostvds_domain_name: str = "default"
+    # Регион из openrc.sh (OS_REGION_NAME). Если задан — при выборе
+    # compute endpoint из каталога Keystone фильтруем по этому региону.
+    hostvds_region_name: str | None = None
+    # Тип endpoint из openrc.sh (OS_INTERFACE): public / internal / admin.
+    hostvds_interface: str = "public"
 
     # Тариф (flavor) и образ ОС для новых серверов — самые дешёвые значения
     # смотрите в панели HostVDS или через API (списки flavors/images).
