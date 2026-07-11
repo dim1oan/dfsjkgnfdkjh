@@ -47,33 +47,24 @@ def _strip_html(text: str) -> str:
 # Paris, Dallas...), а не зоной доступности (зона обычно одна — «nova»).
 # "region_keywords" — слова для поиска нужного региона в каталоге Keystone.
 # "az" / "az_keywords" — на случай, если у региона несколько зон.
-COUNTRIES: dict[str, dict] = {
+COUNTRIES: dict[ str, dict] = {
     "nl": {
         "name": "Нидерланды", "flag": "🇳🇱",
-        "az": "Amsterdam", "az_keywords": ["amsterdam", "nl"],
-        "region_keywords": ["amsterdam", "ams", "nl"],
-    },
-    "fr": {
-        "name": "Франция", "flag": "🇫🇷",
-        "az": "Paris", "az_keywords": ["paris", "fr"],
-        "region_keywords": ["paris", "par", "fr"],
+        "az": "nova", "az_keywords": ["nova"],
+        "region_keywords": ["eu-west2"],
     },
     "us": {
         "name": "США", "flag": "🇺🇸",
-        "az": "Dallas", "az_keywords": ["dallas", "us"],
-        "region_keywords": ["dallas", "dal", "us"],
+        "az": "nova", "az_keywords": ["nova"],
+        "region_keywords": ["us-east", "us-west"],
     },
     "hk": {
         "name": "Гонконг", "flag": "🇭🇰",
-        "az": "Hong Kong", "az_keywords": ["hong", "hk"],
-        "region_keywords": ["hong", "hk"],
-    },
-    "kz": {
-        "name": "Казахстан", "flag": "🇰🇿",
-        "az": "Almaty", "az_keywords": ["almaty", "kz"],
-        "region_keywords": ["almaty", "alm", "kz"],
+        "az": "nova", "az_keywords": ["nova"],
+        "region_keywords": ["asia-east1"],
     },
 }
+
 
 
 @dataclass
@@ -336,9 +327,10 @@ class HostVDSClient:
         Neutron (сервис network из каталога Keystone). Предпочитаем сеть
         с именем, содержащим public/ext/internet; иначе берём первую.
         """
-        def pick(nets: list[dict]) -> str | None:
+        def pick( nets: list[ dict]) -> str | None:
             if not nets:
                 return None
+            return nets[0]["id"]
             for net in nets:
                 label = (net.get("label") or net.get("name") or "").lower()
                 if any( w in label for w in ("public", "ext", "internet", "edgewall")):
