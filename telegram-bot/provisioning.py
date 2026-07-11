@@ -43,29 +43,35 @@ def _strip_html(text: str) -> str:
 
 
 # ── Карта стран → зоны/регионы HostVDS ───────────────────────────────────────
-# "az" — предпочитаемое имя зоны, "az_keywords" — слова для поиска реальной
-# зоны в списке GET {compute}/os-availability-zone (имена зон у HostVDS
-# могут отличаться: amsterdam-1, paris-1 и т.п.).
+# У HostVDS локация сервера определяется РЕГИОНОМ OpenStack (Amsterdam,
+# Paris, Dallas...), а не зоной доступности (зона обычно одна — «nova»).
+# "region_keywords" — слова для поиска нужного региона в каталоге Keystone.
+# "az" / "az_keywords" — на случай, если у региона несколько зон.
 COUNTRIES: dict[str, dict] = {
     "nl": {
         "name": "Нидерланды", "flag": "🇳🇱",
         "az": "Amsterdam", "az_keywords": ["amsterdam", "nl"],
+        "region_keywords": ["amsterdam", "ams", "nl"],
     },
     "fr": {
         "name": "Франция", "flag": "🇫🇷",
         "az": "Paris", "az_keywords": ["paris", "fr"],
+        "region_keywords": ["paris", "par", "fr"],
     },
     "us": {
         "name": "США", "flag": "🇺🇸",
         "az": "Dallas", "az_keywords": ["dallas", "us"],
+        "region_keywords": ["dallas", "dal", "us"],
     },
     "hk": {
         "name": "Гонконг", "flag": "🇭🇰",
         "az": "Hong Kong", "az_keywords": ["hong", "hk"],
+        "region_keywords": ["hong", "hk"],
     },
     "kz": {
         "name": "Казахстан", "flag": "🇰🇿",
         "az": "Almaty", "az_keywords": ["almaty", "kz"],
+        "region_keywords": ["almaty", "alm", "kz"],
     },
 }
 
@@ -134,6 +140,10 @@ class HostVDSClient:
         self._token: str | None = None
         self._compute_url: str | None = None
         self._network_url: str | None = None
+        self._region: str | None = None
+        # {region: {"compute": url, "network": url}} — заполняется
+        # при аутентификации из каталога Keystone.
+        self._endpoints: dict[str, dict[str, str]] = {}
 
     async def _authenticate(self, session: aiohttp.ClientSession) -> None:
         """Keystone: получаем токен и endpoint сервиса compute."""
@@ -196,27 +206,81 @@ class HostVDSClient:
                 "(нужен API-пароль из панели, не пароль от аккаунта)."
             )
 
+        # Собираем endpoints ВСЕХ регионов: {region: {"compute": url, ...}}.
+        # Локация сервера у HostVDS определяется регионом, поэтому для
+        # мультистрановости нужно знать все доступные регионы.
         wanted_interface = (settings.hostvds_interface or "public").lower()
-        wanted_region = settings.hostvds_region_name
+        self._endpoints = {}
         for svc in body["token"]["catalog"]:
             if svc["type"] not in ("compute", "network"):
                 continue
             for ep in svc["endpoints"]:
                 if ep["interface"] != wanted_interface:
                     continue
-                if wanted_region and ep.get("region") != wanted_region:
-                    continue
-                if svc["type"] == "compute":
-                    self._compute_url = ep["url"]
-                else:
-                    self._network_url = ep["url"].rstrip("/")
-                break
-        if not self._compute_url:
+                region = ep.get("region") or "default"
+                self._endpoints.setdefault(region, {})[svc["type"]] = (
+                    ep["url"].rstrip("/")
+                )
+
+        regions_with_compute = [
+            r for r, eps in self._endpoints.items() if "compute" in eps
+        ]
+        if not regions_with_compute:
             raise ProvisioningError(
                 "Compute endpoint не найден в каталоге "
-                f"(interface={wanted_interface}, region={wanted_region or 'любой'}). "
-                "Проверьте HOSTVDS_REGION_NAME / HOSTVDS_INTERFACE в .env."
+                f"(interface={wanted_interface}). "
+                "Проверьте HOSTVDS_INTERFACE в .env."
             )
+        logger.info(
+            "Доступные регионы: %s", ", ".join(sorted(regions_with_compute))
+        )
+
+        # Регион по умолчанию: из .env или первый доступный.
+        default_region = settings.hostvds_region_name
+        if default_region not in regions_with_compute:
+            default_region = regions_with_compute[0]
+        self._use_region(default_region)
+
+    def _use_region(self, region: str) -> None:
+        """Переключает клиента на endpoints указанного региона."""
+        eps = self._endpoints.get(region, {})
+        if "compute" not in eps:
+            raise ProvisioningError(
+                f"В регионе «{region}» нет compute endpoint. Доступные: "
+                + ", ".join(sorted(self._endpoints))
+            )
+        self._compute_url = eps["compute"]
+        self._network_url = eps.get("network")
+        self._region = region
+        logger.info("Используем регион «%s»", region)
+
+    def _select_region_for_country(self, country: dict) -> str:
+        """Подбирает регион по ключевым словам страны.
+
+        Если совпадений нет и регион всего один — используем его.
+        Иначе — ошибка со списком доступных регионов.
+        """
+        regions = sorted(
+            r for r, eps in self._endpoints.items() if "compute" in eps
+        )
+        keywords = country.get("region_keywords", [])
+        for kw in keywords:
+            for r in regions:
+                if kw in r.lower():
+                    return r
+        if len(regions) == 1:
+            logger.info(
+                "Регион для «%s» не найден по ключевым словам, "
+                "используем единственный «%s»",
+                country["name"], regions[0],
+            )
+            return regions[0]
+        raise ProvisioningError(
+            f"Регион для «{country['name']}» не найден. "
+            "Доступные регионы у провайдера: " + ", ".join(regions)
+            + "\nДобавьте подходящее ключевое слово в region_keywords "
+            "в COUNTRIES (provisioning.py)."
+        )
 
     def _headers(self) -> dict:
         return {"X-Auth-Token": self._token or ""}
@@ -226,7 +290,7 @@ class HostVDSClient:
     ) -> str:
         """Ищет ID flavor/image по имени.
 
-        Сначала точное совпадение (без учёта регистра), затем «мягкое»:
+        Сначала точное совпадени�� (без учёта регистра), затем «мягкое»:
         пробелы/дефисы/подчёркивания считаются одинаковыми, суффикс -amd64
         не обязателен. Например, «Ubuntu 24.04» найдёт «Ubuntu-24.04-amd64».
         """
@@ -357,6 +421,18 @@ class HostVDSClient:
                 if kw in z.lower():
                     return z
 
+        # 3. Совпадений нет. Если зона всего одна (типичный случай —
+        #    единственная зона «nova»: локация тогда определяется регионом
+        #    из HOSTVDS_REGION_NAME, а не зоной) — используем её.
+        if len(zones) == 1:
+            logger.info(
+                "Совпадений по стране нет, используем единственную зону «%s» "
+                "(локация определяется регионом OS_REGION_NAME)",
+                zones[0],
+            )
+            return zones[0]
+
+        # Зон несколько, но ни одна не подходит — не рискуем, сообщаем.
         raise ProvisioningError(
             f"Зона для «{country['name']}» не найдена. "
             "Доступные зоны у провайдера: " + ", ".join(zones)
@@ -380,6 +456,11 @@ class HostVDSClient:
             timeout=aiohttp.ClientTimeout(total=60)
         ) as session:
             await self._authenticate(session)
+
+            # Переключаемся на регион, соответствующий выбранной стране
+            # (локация сервера у HostVDS определяется регионом).
+            region = self._select_region_for_country(country)
+            self._use_region(region)
 
             flavor_id = await self._find_id(
                 session, "/flavors", "flavors", settings.hostvds_flavor
