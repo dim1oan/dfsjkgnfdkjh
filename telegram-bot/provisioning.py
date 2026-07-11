@@ -20,7 +20,9 @@ GET /v2.1/os-availability-zone — ниже заготовка карты стр
 import asyncio
 import base64
 import logging
+import re
 from dataclasses import dataclass
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 
@@ -32,6 +34,12 @@ logger = logging.getLogger(__name__)
 
 class ProvisioningError(RuntimeError):
     """Ошибка автоаренды сервера."""
+
+
+def _strip_html(text: str) -> str:
+    """Убирает HTML-теги из ответа сервера (например, страниц ошибок nginx),
+    чтобы текст можно было безопасно отправить в Telegram."""
+    return re.sub(r"<[^>]+>", " ", text).strip()
 
 
 # ── Карта стран → зоны/регионы HostVDS ───────────────────────────────────────
@@ -132,23 +140,44 @@ class HostVDSClient:
                 },
             }
         }
-        try:
-            async with session.post(
-                f"{self._auth_url}/auth/tokens", json=payload
-            ) as resp:
-                if resp.status not in (200, 201):
-                    raise ProvisioningError(
-                        f"Keystone auth failed ({resp.status}): {await resp.text()}"
-                    )
-                self._token = resp.headers["X-Subject-Token"]
-                body = await resp.json()
-        except aiohttp.ClientConnectorError as exc:
+        # Кандидаты URL: сначала как задано в .env; если порт не указан,
+        # дополнительно пробуем стандартный порт Keystone :5000
+        # (частая причина 405: URL указывает на веб-сайт, а не на API).
+        candidates = [self._auth_url]
+        parsed = urlsplit(self._auth_url)
+        if parsed.port is None:
+            with_port = parsed._replace(
+                netloc=f"{parsed.hostname}:5000"
+            )
+            candidates.append(urlunsplit(with_port))
+
+        body: dict | None = None
+        errors: list[str] = []
+        for auth_url in candidates:
+            try:
+                async with session.post(
+                    f"{auth_url}/auth/tokens", json=payload
+                ) as resp:
+                    if resp.status in (200, 201):
+                        self._token = resp.headers["X-Subject-Token"]
+                        body = await resp.json()
+                        self._auth_url = auth_url
+                        break
+                    text = _strip_html(await resp.text())[:300]
+                    errors.append(f"{auth_url} → HTTP {resp.status}: {text}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                errors.append(f"{auth_url} → {exc}")
+
+        if body is None:
             raise ProvisioningError(
-                f"Не удалось подключиться к {self._auth_url} — адрес не "
-                f"существует или недоступен ({exc}).\n"
-                "Проверьте HOSTVDS_AUTH_URL в .env: возьмите его из файла "
-                "openrc.sh в панели HostVDS (строка export OS_AUTH_URL=...)."
-            ) from exc
+                "Keystone auth не удался. Пробовал:\n"
+                + "\n".join(f"  • {e}" for e in errors)
+                + "\n\nЕсли видите «405 Not Allowed» — HOSTVDS_AUTH_URL "
+                "указывает на веб-сайт, а не на API. Возьмите точное значение "
+                "OS_AUTH_URL из файла openrc.sh (панель HostVDS → API). "
+                "Если «401» — проверьте HOSTVDS_USERNAME / HOSTVDS_PASSWORD "
+                "(нужен API-пароль из панели, не пароль от аккаунта)."
+            )
 
         wanted_interface = (settings.hostvds_interface or "public").lower()
         wanted_region = settings.hostvds_region_name
@@ -190,7 +219,7 @@ class HostVDSClient:
         self, country_code: str, panel_user: str, panel_pass: str
     ) -> str:
         """
-        Создаёт VPS в нужной стране, ждёт ACTIVE, возвра��ает публичный IP.
+        Создаёт VPS в нужной стране, ждёт ACTIVE, возвращает публичный IP.
         """
         country = COUNTRIES.get(country_code)
         if country is None:
