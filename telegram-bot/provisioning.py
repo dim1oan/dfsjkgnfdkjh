@@ -429,7 +429,6 @@ class HostVDSClient:
             f"Зона для «{country['name']}» не найдена. "
             "Доступные зоны у провайдера: " + ", ".join(zones)
         )
-
     async def create_server(
         self, country_code: str, panel_user: str, panel_pass: str
     ) -> str:
@@ -463,58 +462,40 @@ class HostVDSClient:
 
             az = await self._resolve_availability_zone(session, country)
 
+            # 1. Принудительно запрашиваем список сетей для выбранного региона
+            async with session.get(f"{self._compute_url}/os-networks", headers=self._headers()) as net_resp:
+                net_data = await net_resp.json()
+                nets_list = net_data.get("networks", [])
+                if not nets_list:
+                    raise ProvisioningError("Не удалось найти доступную сеть edgewall для этого региона")
+                chosen_net_id = nets_list[0]["id"]
+
+            # 2. Формируем payload сразу с точным UUID сети
             payload = {
                 "server": {
                     "name": f"vpn-{country_code}",
                     "flavorRef": flavor_id,
                     "imageRef": image_id,
                     "user_data": user_data,
-                    "networks": "auto",
+                    "networks": [{"uuid": chosen_net_id}],
                 }
             }
             if az:
                 payload["server"]["availability_zone"] = az
-            # networks="auto" требует микроверсию Nova API >= 2.37,
-            # поэтому передаём соответствующий заголовок.
-            create_headers = {
-                **self._headers(),
-                "X-OpenStack-Nova-API-Version": "2.37",
-            }
+
+            # 3. Отправляем один прямой запрос на создание сервера
             async with session.post(
                 f"{self._compute_url}/servers",
                 json=payload,
-                headers=create_headers,
+                headers=self._headers(),
             ) as resp:
-                if resp.status in (200, 202):
-                    server_id = (await resp.json())["server"]["id"]
-                elif resp.status == 400:
-                    # Микроверсия не поддерживается — выбираем сеть по UUID.
-                    err_text = await resp.text()
-                    logger.warning(
-                        "networks='auto' отклонён (%s), пробую явный UUID сети",
-                        err_text[:200],
-                    )
-                    net_id = await self._find_network_id(session)
-                    payload["server"]["networks"] = [{"uuid": net_id}]
-                    async with session.post(
-                        f"{self._compute_url}/servers",
-                        json=payload,
-                        headers=self._headers(),
-                    ) as resp2:
-                        if resp2.status not in (200, 202):
-                            raise ProvisioningError(
-                                f"Создание сервера отклонено ({resp2.status}): "
-                                f"{await resp2.text()}"
-                            )
-                        server_id = (await resp2.json())["server"]["id"]
-                else:
-                    raise ProvisioningError(
-                        f"Создание сервера отклонено ({resp.status}): "
-                        f"{await resp.text()}"
-                    )
-            logger.info("Сервер %s создаётся (id=%s)…", country_code, server_id)
+                if resp.status not in (200, 202):
+                    raise ProvisioningError(f"Создание сервера отклонено ({resp.status}): {await resp.text()}")
+                server_id = (await resp.json())["server"]["id"]
 
-            # Ждём ACTIVE (до ~5 минут)
+            logger.info("Сервер %s успешно отправлен в обработку HostVDS (id=%s)…", country_code, server_id)
+
+            # 4. Цикл ожидания, пока сервер включится (ACTIVE)
             for _ in range(60):
                 await asyncio.sleep(5)
                 async with session.get(
@@ -527,10 +508,10 @@ class HostVDSClient:
                     logger.info("Сервер ACTIVE, IP=%s", ip)
                     return ip
                 if info["status"] == "ERROR":
-                    raise ProvisioningError(f"Сервер в статусе ERROR: {info}")
+                    raise ProvisioningError(f"Сервер встал в статус ошибки на стороне хостинга: {info}")
 
-        raise ProvisioningError("Таймаут ожидания статуса ACTIVE")
-
+            raise ProvisioningError("Превышено время ожидания включения сервера (Таймаут ACTIVE)")
+    
 
 def _extract_public_ip(server_info: dict) -> str:
     """Достаёт публичный IPv4 из ответа Nova."""
