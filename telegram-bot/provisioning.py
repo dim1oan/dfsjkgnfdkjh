@@ -43,14 +43,30 @@ def _strip_html(text: str) -> str:
 
 
 # ── Карта стран → зоны/регионы HostVDS ───────────────────────────────────────
-# Сверьте значения availability_zone со своей панелью HostVDS
-# (или получите список: GET {compute}/os-availability-zone).
+# "az" — предпочитаемое имя зоны, "az_keywords" — слова для поиска реальной
+# зоны в списке GET {compute}/os-availability-zone (имена зон у HostVDS
+# могут отличаться: amsterdam-1, paris-1 и т.п.).
 COUNTRIES: dict[str, dict] = {
-    "nl": {"name": "Нидерланды", "flag": "🇳🇱", "az": "Amsterdam"},
-    "fr": {"name": "Франция", "flag": "🇫🇷", "az": "Paris"},
-    "us": {"name": "США", "flag": "🇺🇸", "az": "Dallas"},
-    "hk": {"name": "Гонконг", "flag": "🇭🇰", "az": "Hong Kong"},
-    "kz": {"name": "Казахстан", "flag": "🇰🇿", "az": "Almaty"},
+    "nl": {
+        "name": "Нидерланды", "flag": "🇳🇱",
+        "az": "Amsterdam", "az_keywords": ["amsterdam", "nl"],
+    },
+    "fr": {
+        "name": "Франция", "flag": "🇫🇷",
+        "az": "Paris", "az_keywords": ["paris", "fr"],
+    },
+    "us": {
+        "name": "США", "flag": "🇺🇸",
+        "az": "Dallas", "az_keywords": ["dallas", "us"],
+    },
+    "hk": {
+        "name": "Гонконг", "flag": "🇭🇰",
+        "az": "Hong Kong", "az_keywords": ["hong", "hk"],
+    },
+    "kz": {
+        "name": "Казахстан", "flag": "🇰🇿",
+        "az": "Almaty", "az_keywords": ["almaty", "kz"],
+    },
 }
 
 
@@ -296,6 +312,56 @@ class HostVDSClient:
             "networks='auto', а список сетей получить не получилось."
         )
 
+    async def _resolve_availability_zone(
+        self, session: aiohttp.ClientSession, country: dict
+    ) -> str | None:
+        """Подбирает реальное имя зоны доступности из списка провайдера.
+
+        Возвращает имя зоны или None, если список получить не удалось
+        (тогда зону в запросе лучше не указывать вовсе).
+        """
+        try:
+            async with session.get(
+                f"{self._compute_url}/os-availability-zone",
+                headers=self._headers(),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(
+                        "os-availability-zone → HTTP %s, зону не указываем",
+                        resp.status,
+                    )
+                    return None
+                data = await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.warning("Не удалось получить список зон: %s", exc)
+            return None
+
+        zones = [
+            z["zoneName"]
+            for z in data.get("availabilityZoneInfo", [])
+            if z.get("zoneState", {}).get("available", True)
+        ]
+        if not zones:
+            return None
+        logger.info("Доступные зоны: %s", ", ".join(zones))
+
+        # 1. Точное совпадение с предпочитаемым именем
+        preferred = country["az"].lower()
+        for z in zones:
+            if z.lower() == preferred:
+                return z
+
+        # 2. Поиск по ключевым словам страны (amsterdam-1 и т.п.)
+        for kw in country.get("az_keywords", []):
+            for z in zones:
+                if kw in z.lower():
+                    return z
+
+        raise ProvisioningError(
+            f"Зона для «{country['name']}» не найдена. "
+            "Доступные зоны у провайдера: " + ", ".join(zones)
+        )
+
     async def create_server(
         self, country_code: str, panel_user: str, panel_pass: str
     ) -> str:
@@ -322,16 +388,19 @@ class HostVDSClient:
                 session, "/images", "images", settings.hostvds_image
             )
 
+            az = await self._resolve_availability_zone(session, country)
+
             payload = {
                 "server": {
                     "name": f"vpn-{country_code}",
                     "flavorRef": flavor_id,
                     "imageRef": image_id,
-                    "availability_zone": country["az"],
                     "user_data": user_data,
                     "networks": "auto",
                 }
             }
+            if az:
+                payload["server"]["availability_zone"] = az
             # networks="auto" требует микроверсию Nova API >= 2.37,
             # поэтому передаём соответствующий заголовок.
             create_headers = {
