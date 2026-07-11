@@ -341,7 +341,7 @@ class HostVDSClient:
                 return None
             for net in nets:
                 label = (net.get("label") or net.get("name") or "").lower()
-                if any(w in label for w in ("public", "ext", "internet")):
+                if any( w in label for w in ("public", "ext", "internet", "edgewall")):
                     return net["id"]
             return nets[0]["id"]
 
