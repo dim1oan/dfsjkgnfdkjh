@@ -1,101 +1,312 @@
 """
-Конфигурация бота.
+Автоаренда VPS в HostVDS через OpenStack API + автоустановка 3x-ui.
 
-Загружает переменные окружения из файла `.env` с помощью Pydantic Settings.
-Обязательные переменные:
-    BOT_TOKEN    — токен Telegram-бота от @BotFather
-    DATABASE_URL — строка подключения к БД (async-драйвер)
+Как это работает:
+    1. Аутентификация в Keystone (получаем токен и каталог сервисов).
+    2. Создание сервера (Nova) с cloud-init скриптом, который ставит
+       Docker + 3x-ui и задаёт логин/пароль панели.
+    3. Ожидание статуса ACTIVE и получение публичного IP.
+    4. Ожидание, пока панель 3x-ui поднимется, затем создание
+       VLESS/Reality-инбаунда через её API.
+    5. Сервер сохраняется в БД и становится доступен для продажи.
+
+ВАЖНО: провижининг занимает 3–7 минут, поэтому вызывается только
+администратором (/add_server), а не клиентами при покупке.
+
+Названия зон доступности (locations) HostVDS уточните в панели или через
+GET /v2.1/os-availability-zone — ниже заготовка карты стран.
 """
 
-from functools import lru_cache
-from pathlib import Path
+import asyncio
+import base64
+import logging
+from dataclasses import dataclass
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+import aiohttp
 
-# Путь к .env рядом с этим файлом — работает независимо от того,
-# из какой директории запускается бот.
-_ENV_FILE = Path(__file__).resolve().parent / ".env"
+from config import settings
+from xui_client import XUIClient
+
+logger = logging.getLogger(__name__)
 
 
-class Settings(BaseSettings):
-    """Настройки приложения, читаемые из окружения / .env."""
+class ProvisioningError(RuntimeError):
+    """Ошибка автоаренды сервера."""
 
-    model_config = SettingsConfigDict(
-        env_file=_ENV_FILE,
-        env_file_encoding="utf-8",
-        extra="ignore",
+
+# ── Карта стран → зоны/регионы HostVDS ───────────────────────────────────────
+# Сверьте значения availability_zone со своей панелью HostVDS
+# (или получите список: GET {compute}/os-availability-zone).
+COUNTRIES: dict[str, dict] = {
+    "nl": {"name": "Нидерланды", "flag": "🇳🇱", "az": "Amsterdam"},
+    "fr": {"name": "Франция", "flag": "🇫🇷", "az": "Paris"},
+    "us": {"name": "США", "flag": "🇺🇸", "az": "Dallas"},
+    "hk": {"name": "Гонконг", "flag": "🇭🇰", "az": "Hong Kong"},
+    "kz": {"name": "Казахстан", "flag": "🇰🇿", "az": "Almaty"},
+}
+
+
+@dataclass
+class ProvisionedServer:
+    """Результат провижининга."""
+
+    ip: str
+    panel_url: str
+    panel_username: str
+    panel_password: str
+    inbound_id: int
+    vless_port: int
+    public_key: str
+    sni: str
+    short_id: str
+
+
+def _cloud_init(panel_port: int, panel_user: str, panel_pass: str) -> str:
+    """
+    cloud-init: Docker + 3x-ui + фиксированные логин/пароль панели.
+
+    Панель поднимается на http://IP:{panel_port} без basePath.
+    """
+    return f"""#cloud-config
+runcmd:
+  - curl -fsSL https://get.docker.com | sh
+  - mkdir -p /opt/3x-ui/db /opt/3x-ui/cert
+  - >
+    docker run -d --name 3x-ui --restart unless-stopped --network host
+    -v /opt/3x-ui/db:/etc/x-ui -v /opt/3x-ui/cert:/root/cert
+    ghcr.io/mhsanaei/3x-ui:latest
+  - sleep 20
+  - docker exec 3x-ui /app/x-ui setting -username {panel_user} -password {panel_pass} -port {panel_port} -webBasePath /
+  - docker restart 3x-ui
+"""
+
+
+class HostVDSClient:
+    """Минимальный OpenStack-клиент (Keystone + Nova) через aiohttp."""
+
+    def __init__(self) -> None:
+        if not settings.hostvds_auth_url:
+            raise ProvisioningError(
+                "Не задан HOSTVDS_AUTH_URL в .env.\n"
+                "Скачайте файл openrc.sh в панели HostVDS "
+                "(раздел API → «OpenStack CLI клиент»), найдите в нём строку "
+                "export OS_AUTH_URL=... и скопируйте её значение:\n"
+                "HOSTVDS_AUTH_URL=https://<адрес-из-openrc>/v3"
+            )
+        if not (
+            settings.hostvds_username
+            and settings.hostvds_password
+            and settings.hostvds_project_name
+        ):
+            raise ProvisioningError(
+                "Не заданы HOSTVDS_USERNAME / HOSTVDS_PASSWORD / "
+                "HOSTVDS_PROJECT_NAME в .env"
+            )
+        # Нормализуем URL: убираем хвостовой слэш, гарантируем /v3 на конце.
+        auth_url = settings.hostvds_auth_url.rstrip("/")
+        if not auth_url.endswith("/v3"):
+            auth_url += "/v3"
+        self._auth_url = auth_url
+        self._token: str | None = None
+        self._compute_url: str | None = None
+
+    async def _authenticate(self, session: aiohttp.ClientSession) -> None:
+        """Keystone: получаем токен и endpoint сервиса compute."""
+        payload = {
+            "auth": {
+                "identity": {
+                    "methods": ["password"],
+                    "password": {
+                        "user": {
+                            "name": settings.hostvds_username,
+                            "domain": {"name": settings.hostvds_domain_name},
+                            "password": settings.hostvds_password,
+                        }
+                    },
+                },
+                "scope": {
+                    "project": {
+                        "name": settings.hostvds_project_name,
+                        "domain": {"name": settings.hostvds_domain_name},
+                    }
+                },
+            }
+        }
+        try:
+            async with session.post(
+                f"{self._auth_url}/auth/tokens", json=payload
+            ) as resp:
+                if resp.status not in (200, 201):
+                    raise ProvisioningError(
+                        f"Keystone auth failed ({resp.status}): {await resp.text()}"
+                    )
+                self._token = resp.headers["X-Subject-Token"]
+                body = await resp.json()
+        except aiohttp.ClientConnectorError as exc:
+            raise ProvisioningError(
+                f"Не удалось подключиться к {self._auth_url} — адрес не "
+                f"существует или недоступен ({exc}).\n"
+                "Проверьте HOSTVDS_AUTH_URL в .env: возьмите его из файла "
+                "openrc.sh в панели HostVDS (строка export OS_AUTH_URL=...)."
+            ) from exc
+
+        wanted_interface = (settings.hostvds_interface or "public").lower()
+        wanted_region = settings.hostvds_region_name
+        for svc in body["token"]["catalog"]:
+            if svc["type"] != "compute":
+                continue
+            for ep in svc["endpoints"]:
+                if ep["interface"] != wanted_interface:
+                    continue
+                if wanted_region and ep.get("region") != wanted_region:
+                    continue
+                self._compute_url = ep["url"]
+                break
+        if not self._compute_url:
+            raise ProvisioningError(
+                "Compute endpoint не найден в каталоге "
+                f"(interface={wanted_interface}, region={wanted_region or 'любой'}). "
+                "Проверьте HOSTVDS_REGION_NAME / HOSTVDS_INTERFACE в .env."
+            )
+
+    def _headers(self) -> dict:
+        return {"X-Auth-Token": self._token or ""}
+
+    async def _find_id(
+        self, session: aiohttp.ClientSession, path: str, key: str, name: str
+    ) -> str:
+        """Ищет ID flavor/image по имени."""
+        async with session.get(
+            f"{self._compute_url}{path}", headers=self._headers()
+        ) as resp:
+            data = await resp.json()
+        for item in data.get(key, []):
+            if item["name"].lower() == name.lower():
+                return item["id"]
+        raise ProvisioningError(f"{key}: «{name}» не найден. Доступны: "
+                                + ", ".join(i["name"] for i in data.get(key, [])))
+
+    async def create_server(
+        self, country_code: str, panel_user: str, panel_pass: str
+    ) -> str:
+        """
+        Создаёт VPS в нужной стране, ждёт ACTIVE, возвра��ает публичный IP.
+        """
+        country = COUNTRIES.get(country_code)
+        if country is None:
+            raise ProvisioningError(f"Неизвестная страна: {country_code}")
+
+        user_data = base64.b64encode(
+            _cloud_init(settings.xui_panel_port, panel_user, panel_pass).encode()
+        ).decode()
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=60)
+        ) as session:
+            await self._authenticate(session)
+
+            flavor_id = await self._find_id(
+                session, "/flavors", "flavors", settings.hostvds_flavor
+            )
+            image_id = await self._find_id(
+                session, "/images", "images", settings.hostvds_image
+            )
+
+            payload = {
+                "server": {
+                    "name": f"vpn-{country_code}",
+                    "flavorRef": flavor_id,
+                    "imageRef": image_id,
+                    "availability_zone": country["az"],
+                    "user_data": user_data,
+                    "networks": "auto",
+                }
+            }
+            async with session.post(
+                f"{self._compute_url}/servers",
+                json=payload,
+                headers=self._headers(),
+            ) as resp:
+                if resp.status not in (200, 202):
+                    raise ProvisioningError(
+                        f"Создание сервера отклонено ({resp.status}): "
+                        f"{await resp.text()}"
+                    )
+                server_id = (await resp.json())["server"]["id"]
+            logger.info("Сервер %s создаётся (id=%s)…", country_code, server_id)
+
+            # Ждём ACTIVE (до ~5 минут)
+            for _ in range(60):
+                await asyncio.sleep(5)
+                async with session.get(
+                    f"{self._compute_url}/servers/{server_id}",
+                    headers=self._headers(),
+                ) as resp:
+                    info = (await resp.json())["server"]
+                if info["status"] == "ACTIVE":
+                    ip = _extract_public_ip(info)
+                    logger.info("Сервер ACTIVE, IP=%s", ip)
+                    return ip
+                if info["status"] == "ERROR":
+                    raise ProvisioningError(f"Сервер в статусе ERROR: {info}")
+
+        raise ProvisioningError("Таймаут ожидания статуса ACTIVE")
+
+
+def _extract_public_ip(server_info: dict) -> str:
+    """Достаёт публичный IPv4 из ответа Nova."""
+    for network in server_info.get("addresses", {}).values():
+        for addr in network:
+            if addr.get("version") == 4:
+                return addr["addr"]
+    raise ProvisioningError("Публичный IPv4 не найден у сервера")
+
+
+async def provision_server(country_code: str) -> ProvisionedServer:
+    """
+    Полный цикл: аренда VPS → ожидание панели → создание Reality-инбаунда.
+    """
+    panel_user = settings.xui_panel_username
+    panel_pass = settings.xui_panel_password
+    if not panel_pass:
+        raise ProvisioningError("Не задан XUI_PANEL_PASSWORD в .env")
+
+    client = HostVDSClient()
+    ip = await client.create_server(country_code, panel_user, panel_pass)
+
+    panel_url = f"http://{ip}:{settings.xui_panel_port}"
+
+    # Ждём, пока cloud-init поставит Docker и поднимет панель (до ~6 минут)
+    await _wait_for_panel(panel_url)
+
+    async with XUIClient(panel_url, panel_user, panel_pass) as xui:
+        inbound = await xui.create_reality_inbound(port=443, sni=settings.vless_sni)
+
+    return ProvisionedServer(
+        ip=ip,
+        panel_url=panel_url,
+        panel_username=panel_user,
+        panel_password=panel_pass,
+        inbound_id=inbound.inbound_id,
+        vless_port=inbound.port,
+        public_key=inbound.public_key,
+        sni=inbound.sni,
+        short_id=inbound.short_id,
     )
 
-    # Токен бота (получить у @BotFather)
-    bot_token: str
 
-    # Async-URL базы данных.
-    # PostgreSQL: postgresql+asyncpg://user:password@host:5432/vpn_db
-    # SQLite:     sqlite+aiosqlite:///./vpn_bot.db
-    database_url: str = "sqlite+aiosqlite:///./vpn_bot.db"
-
-    # Прокси для подключения к Telegram API (опционально).
-    # Нужен, если api.telegram.org недоступен напрямую.
-    # Примеры:
-    #   socks5://127.0.0.1:10808   (v2rayN)
-    #   socks5://127.0.0.1:2080    (Nekoray/NekoBox)
-    #   socks5://user:pass@host:1080
-    proxy_url: str | None = None
-
-    # Контакт поддержки (username без @)
-    support_username: str = "vpn_support"
-
-    # Telegram ID администраторов (через запятую в .env: ADMIN_IDS=123,456).
-    # Только им доступны команды /servers, /add_server и т.п.
-    admin_ids: str = ""
-
-    # ── HostVDS (OpenStack API) — для автоаренды серверов ────────────────────
-    # Данные из панели HostVDS: раздел API / OpenStack credentials.
-    #
-    # ВАЖНО: HOSTVDS_AUTH_URL нужно взять из файла openrc.sh, который
-    # скачивается в панели HostVDS (раздел API → «OpenStack CLI клиент»).
-    # Внутри openrc.sh найдите строку:
-    #     export OS_AUTH_URL=https://<адрес>/v3
-    # и скопируйте её значение в .env:
-    #     HOSTVDS_AUTH_URL=https://<адрес>/v3
-    # Логин (HOSTVDS_USERNAME) — это значение вида hostvds-xxxx из панели,
-    # проект (HOSTVDS_PROJECT_NAME) и домен — тоже из openrc.sh
-    # (OS_PROJECT_NAME / OS_USER_DOMAIN_NAME).
-    hostvds_auth_url: str | None = None
-    hostvds_username: str | None = None
-    hostvds_password: str | None = None
-    hostvds_project_name: str | None = None
-    hostvds_domain_name: str = "default"
-    # Регион из openrc.sh (OS_REGION_NAME). Если задан — при выборе
-    # compute endpoint из каталога Keystone фильтруем по этому региону.
-    hostvds_region_name: str | None = None
-    # Тип endpoint из openrc.sh (OS_INTERFACE): public / internal / admin.
-    hostvds_interface: str = "public"
-
-    # Тариф (flavor) и образ ОС для новых серверов — самые дешёвые значения
-    # смотрите в панели HostVDS или через API (списки flavors/images).
-    hostvds_flavor: str = "v1.nano"
-    hostvds_image: str = "Ubuntu 24.04"
-
-    # ── Учётные данные панелей 3x-ui на новых серверах ───────────────────────
-    # Эти логин/пароль будут установлены на каждый новый сервер при провижининге
-    xui_panel_port: int = 2053
-    xui_panel_username: str = "admin"
-    xui_panel_password: str | None = None
-
-    # SNI (маскировка Reality) для новых инбаундов
-    vless_sni: str = "yahoo.com"
-
-    @property
-    def admin_id_list(self) -> list[int]:
-        """ADMIN_IDS из .env в виде списка чисел."""
-        return [int(x) for x in self.admin_ids.replace(" ", "").split(",") if x]
-
-
-@lru_cache
-def get_settings() -> Settings:
-    """Кешированный доступ к настройкам."""
-    return Settings()
-
-
-settings = get_settings()
+async def _wait_for_panel(panel_url: str, attempts: int = 72) -> None:
+    """Опрашивает панель каждые 5 секунд, пока она не начнёт отвечать."""
+    async with aiohttp.ClientSession() as session:
+        for _ in range(attempts):
+            await asyncio.sleep(5)
+            try:
+                async with session.get(
+                    panel_url, timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    if resp.status < 500:
+                        logger.info("Панель %s отвечает", panel_url)
+                        return
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                continue
+    raise ProvisioningError(f"Панель {panel_url} не поднялась за отведённое время")
