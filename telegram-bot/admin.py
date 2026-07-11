@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import html
 import logging
 
 from aiogram import Router
@@ -92,11 +93,15 @@ async def _provision_and_notify(message: Message, code: str) -> None:
         result = await provision_server(code)
     except ProvisioningError as exc:
         logger.exception("Ошибка провижининга %s", code)
-        await message.answer(f"❌ Не удалось создать сервер: {exc}")
+        await message.answer(
+            f"❌ Не удалось создать сервер: {html.escape(str(exc))}"
+        )
         return
     except Exception as exc:  # noqa: BLE001 — сообщаем админу о любой ошибке
         logger.exception("Неожиданная ошибка провижининга %s", code)
-        await message.answer(f"❌ Неожиданная ошибка: {exc}")
+        await message.answer(
+            f"❌ Неожиданная ошибка: {html.escape(str(exc))}"
+        )
         return
 
     async with get_session() as session:
